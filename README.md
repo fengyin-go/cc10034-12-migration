@@ -77,5 +77,42 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## Maxwell 事务边界迁移
+
+`format_adapter` 与 `change_event` 之间新增了一条带真实事务边界的 Maxwell
+适配流水线，旧信封（无提交边界）迁移到输出版本信封（带源实例、位点和提交凭证），
+部署切换期间兼容存量记录与跨版本在途事务。
+
+核心不变量：
+
+- 源日志保留带位点的成员和真实提交标记，回滚后仍可从同一源位点重放；
+- 只有「真实提交 + 成员完整」才一起发布成员信封与提交凭证，未完整事务禁止发布；
+- 源事件时间原样透传，禁止用当前时间代替；
+- 消费端按批次的源实例、下发位点和提交证据校验边界，结果回写回放清单；
+- 幂等台账保证重复回放同一事务只向目标交付一次；
+- 旧版存量信封仍可通过原接口读取。
+
+专用接口前缀 `/api/maxwell`：
+
+| 接口 | 作用 |
+| --- | --- |
+| `POST /ingest` | Maxwell 变更送入适配流水线（带源位点的事务成员） |
+| `POST /commit` | 登记事务的真实提交标记 |
+| `POST /legacy/envelope` / `GET /legacy/envelopes` | 旧信封登记/迁移与存量读取 |
+| `POST /deployment/switch` / `GET /deployment` | 适配环境版本切换与状态 |
+| `POST /transactions/{tx_id}/publish` | 发布可核对的 Maxwell 事件数据批次 |
+| `POST /batches/{batch_id}/consume` | 边界校验 + 幂等下发，回写回放清单 |
+| `POST /rollback` | 中止迁移并回滚，从同一源位点继续消费 |
+| `GET /batches` / `GET /transactions` / `GET /source-log` | 批次、事务、源日志核对 |
+| `GET /replay-manifest` / `GET /cursor/{instance}` / `GET /target-batches` | 回放清单、重放起点、目标交付核对 |
+
+端到端核对脚本：
+
+```bash
+cd backend
+PYTHONPATH=. .venv/bin/python tests/maxwell_migration_scenario.py  # 领域场景 40 项核对
+.venv/bin/python -I tests/maxwell_migration_http.py                # HTTP 主链路冒烟（需先起服务）
+```
+
 领域：数据工程
 子方向：数仓与数据湖

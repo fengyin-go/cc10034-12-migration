@@ -114,3 +114,86 @@ class ChangeEventService(BaseModuleService):
                 "change_event", "已下发"
             )
         return entry, msg
+
+    # ==================================================================
+    # Maxwell 事件数据批次消费：边界校验 + 幂等下发 + 回放清单回写
+    # ==================================================================
+
+    def consume_maxwell_event_batch(
+        self, batch_id: str, *, expected_instance: str | None = None,
+        expected_commit_position: str | None = None,
+    ) -> dict[str, Any]:
+        """消费一个 Maxwell 事件数据批次。
+
+        下发边界以批次携带的源实例、源位点和真实提交凭证为准校验；
+        校验通过才下发目标，结果回写到回放清单。重复回放由总线幂等拦截，
+        同一事务只向目标交付一次。
+        """
+        batch = next((b for b in pipeline_bus.maxwell_batches
+                      if b.batch_id == batch_id), None)
+        if batch is None:
+            return {"batch_id": batch_id, "result": "not_found",
+                    "boundary_verified": False}
+        manifest_row = pipeline_bus.consume_maxwell_batch(
+            batch,
+            expected_instance=expected_instance,
+            expected_position=expected_commit_position)
+        if manifest_row.get("result") == "delivered":
+            pipeline_bus.write_audit(
+                "Maxwell批次下发", batch.tx_id,
+                f"批次 {batch_id} 边界校验通过并交付目标，成员 {batch.member_count} 条",
+                "change_event", "已下发")
+        elif manifest_row.get("result") == "deduplicated":
+            pipeline_bus.write_audit(
+                "Maxwell批次去重", batch.tx_id,
+                f"批次 {batch_id} 重复回放被幂等拦截，目标不重复交付",
+                "change_event", "已下发")
+        else:
+            pipeline_bus.write_audit(
+                "Maxwell批次拒收", batch.tx_id,
+                f"批次 {batch_id} 边界校验失败：{manifest_row.get('boundary_reasons')}",
+                "change_event", "解析失败")
+        return manifest_row
+
+    def consume_pending_maxwell_batches(self, source_instance: str | None = None
+                                        ) -> list[dict[str, Any]]:
+        """连续消费所有已发布但未交付的 Maxwell 批次（部署切换后的串接消费）。"""
+        results: list[dict[str, Any]] = []
+        for batch in pipeline_bus.maxwell_batches:
+            if source_instance and batch.source_instance != source_instance:
+                continue
+            if batch.batch_id in pipeline_bus.maxwell_delivery_ledger:
+                continue
+            results.append(self.consume_maxwell_event_batch(
+                batch.batch_id,
+                expected_instance=batch.source_instance,
+                expected_commit_position=batch.end_position))
+        return results
+
+    def get_replay_manifest(self) -> list[dict[str, Any]]:
+        """回放清单：每次下发/重放的源位点、边界校验与交付结果。"""
+        return list(pipeline_bus.replay_manifest)
+
+    def get_replay_start_position(self, source_instance: str) -> dict[str, Any] | None:
+        """回滚后可继续消费的重放起点（最后确认的同源位点）。"""
+        return pipeline_bus.get_source_cursor(source_instance)
+
+    def rollback_and_resume(self, source_instance: str, replay_position: str | None = None
+                            ) -> dict[str, Any]:
+        """部署失败中止迁移并回滚，再从同一源位点继续消费。
+
+        源日志保留带位点成员与真实提交标记；回滚后重放由幂等台账保证
+        已交付事务不会重复投递目标。
+        """
+        rollback = pipeline_bus.rollback_deployment(source_instance, replay_position)
+        binlog_file, _, binlog_pos = (replay_position or "").rpartition(":")
+        replayed: list[dict[str, Any]] = []
+        if binlog_file and binlog_pos.isdigit():
+            # replay_transaction 内部已串联发布 + 消费端边界校验 + 幂等下发，
+            # 并在回放清单中回写请求的重放源位点。
+            from app.services import service_for
+            adapter = service_for("format_adapter")
+            replayed = adapter.replay_transaction(
+                source_instance, binlog_file, int(binlog_pos))
+        return {"rollback": rollback, "replay_results": replayed,
+                "cursor": pipeline_bus.get_source_cursor(source_instance)}

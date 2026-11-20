@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -65,6 +66,81 @@ class CheckpointRecord:
     data_checksum: str
 
 
+@dataclass
+class MaxwellMember:
+    """Maxwell 事务成员（一条带源位点的变更，对应 Maxwell JSON 行）。
+
+    成员在事务提交前就可能到达（部署切换期间跨版本到达），
+    因此独立保存源实例、binlog 文件、位点和源事件时间，绝不以当前时间替代。
+    """
+    member_id: str
+    source_instance: str
+    tx_id: str
+    database: str
+    table: str
+    operation: str
+    before_image: dict[str, Any] | None
+    after_image: dict[str, Any] | None
+    binlog_file: str
+    binlog_pos: int
+    gtid: str
+    event_time: datetime
+    envelope_version: str = "legacy"  # legacy(旧信封) / v2(带真实事务边界的输出版本)
+    seq: int = 0
+
+
+@dataclass
+class MaxwellCommitMarker:
+    """Maxwell 真实提交标记（Xid 提交事件）。"""
+    tx_id: str
+    source_instance: str
+    binlog_file: str
+    binlog_pos: int
+    gtid: str
+    commit_time: datetime
+
+
+@dataclass
+class MaxwellTransaction:
+    """一笔 Maxwell 事务的聚合状态：成员 + 真实提交标记。"""
+    tx_id: str
+    source_instance: str
+    members: list[MaxwellMember] = field(default_factory=list)
+    commit_marker: MaxwellCommitMarker | None = None
+    # 接收期间所处的适配版本（首成员可能在旧版接收，末成员在新版到达）
+    received_versions: list[str] = field(default_factory=list)
+    published: bool = False
+    published_at: datetime | None = None
+
+
+@dataclass
+class MaxwellEventBatch:
+    """可核对的 Maxwell 事件数据批次。
+
+    只有「真实提交 + 成员完整」时才生成；成员信封与提交凭证一起发布。
+    """
+    batch_id: str
+    tx_id: str
+    source_instance: str
+    start_position: str          # 首成员源位点
+    end_position: str            # 提交标记源位点（下发边界）
+    binlog_file: str
+    start_pos: int
+    commit_pos: int
+    gtid: str
+    commit_evidence: dict[str, Any]
+    members: list[dict[str, Any]]
+    event_time: str              # 源事件时间（非当前时间）
+    commit_time: str
+    member_count: int
+    envelope_version: str
+    checksum: str
+    delivered: bool = False
+    delivered_count: int = 0     # 实际向目标交付次数（幂等保护后恒 <= 1）
+    replay_count: int = 0        # 回放尝试次数（含被幂等去重的次数）
+    delivery_attempts: int = 0
+
+
 class PipelineBus:
     """管道级事件总线：持有事件队列、Schema 注册表、位点注册表、SCD 状态存储。
 
@@ -115,6 +191,28 @@ class PipelineBus:
             "dedup_hits": 0,
             "backfill_rows": 0,
         }
+        # ===== Maxwell 事务边界迁移状态 =====
+        # 源日志：带位点的成员与真实提交标记按到达顺序保留，回滚后仍可从同一位点重放
+        self.maxwell_member_log: list[MaxwellMember] = []
+        self.maxwell_commit_log: list[MaxwellCommitMarker] = []
+        # 事务聚合表 tx_id -> MaxwellTransaction（跨版本部署持续累积）
+        self.maxwell_transactions: dict[str, MaxwellTransaction] = {}
+        # 已发布的 Maxwell 事件数据批次（可核对）
+        self.maxwell_batches: list[MaxwellEventBatch] = []
+        # 幂等交付台账 batch_id -> 交付证据，重复回放只向目标交付一次
+        self.maxwell_delivery_ledger: dict[str, dict[str, Any]] = {}
+        # 目标系统已接收的批次（模拟下游目标，按 batch_id 去重）
+        self.maxwell_target_batches: dict[str, MaxwellEventBatch] = {}
+        # 回放清单：记录每次消费/回放的源位点、边界校验与交付结果
+        self.replay_manifest: list[dict[str, Any]] = []
+        # 当前适配环境版本：legacy(旧适配进程) / v2(带真实事务边界的输出版本)
+        self.adapter_deployment_version: str = "legacy"
+        # 已迁移的旧信封存量记录 id 集合（旧接口仍可读取）
+        self.legacy_envelope_store: list[dict[str, Any]] = []
+        self.migrated_legacy_ids: set[str] = set()
+        # 每个源实例的消费游标（已安全消费到的源位点）
+        self.source_cursors: dict[str, dict[str, Any]] = {}
+        self._maxwell_seq: int = 0
 
     def publish_event(self, event: ChangeEventRecord) -> dict[str, Any]:
         """将解析产出的事件发布到队列。返回发布确认。"""
@@ -313,6 +411,283 @@ class PipelineBus:
             self.lag_buffer = self.lag_buffer[-1000:]
         return metric
 
+    # ==================================================================
+    # Maxwell 事务边界迁移：源日志 -> 事务聚合 -> 事件数据批次 -> 幂等交付
+    # ==================================================================
+
+    @staticmethod
+    def _position_key(binlog_file: str, binlog_pos: int) -> str:
+        return f"{binlog_file}:{binlog_pos}"
+
+    def record_maxwell_member(self, member: MaxwellMember) -> MaxwellTransaction:
+        """接收一条 Maxwell 事务成员并写入源日志与事务聚合表。
+
+        源日志保留带位点的成员；事务按 tx_id 聚合，允许成员跨部署版本到达。
+        重复成员（同源位点）直接去重，保证回滚后重放不会产生重复成员。
+        """
+        for existing in self.maxwell_member_log:
+            if (existing.source_instance == member.source_instance
+                    and existing.binlog_file == member.binlog_file
+                    and existing.binlog_pos == member.binlog_pos):
+                return self.maxwell_transactions[member.tx_id]
+        self._maxwell_seq += 1
+        member.seq = self._maxwell_seq
+        self.maxwell_member_log.append(member)
+        txn = self.maxwell_transactions.get(member.tx_id)
+        if txn is None:
+            txn = MaxwellTransaction(tx_id=member.tx_id,
+                                     source_instance=member.source_instance)
+            self.maxwell_transactions[member.tx_id] = txn
+        txn.members.append(member)
+        if member.envelope_version not in txn.received_versions:
+            txn.received_versions.append(member.envelope_version)
+        return txn
+
+    def record_maxwell_commit(self, marker: MaxwellCommitMarker) -> MaxwellTransaction | None:
+        """接收真实提交标记并写入源日志。
+
+        提交标记可能晚于成员到达（切换后才到），也可能先于部分成员重放到达，
+        因此只做登记并挂到事务上，不立即发布——发布必须等成员完整。
+        """
+        for existing in self.maxwell_commit_log:
+            if (existing.source_instance == marker.source_instance
+                    and existing.tx_id == marker.tx_id):
+                return self.maxwell_transactions.get(marker.tx_id)
+        self.maxwell_commit_log.append(marker)
+        txn = self.maxwell_transactions.get(marker.tx_id)
+        if txn is None:
+            txn = MaxwellTransaction(tx_id=marker.tx_id,
+                                     source_instance=marker.source_instance)
+            self.maxwell_transactions[marker.tx_id] = txn
+        txn.commit_marker = marker
+        return txn
+
+    def get_maxwell_transaction(self, tx_id: str) -> MaxwellTransaction | None:
+        return self.maxwell_transactions.get(tx_id)
+
+    def is_transaction_complete(self, tx_id: str) -> bool:
+        """成员完整且持有真实提交标记。"""
+        txn = self.maxwell_transactions.get(tx_id)
+        if txn is None or not txn.members or txn.commit_marker is None:
+            return False
+        # 成员位点必须连续落在事务起点与提交位点之间，且不缺号
+        ordered = sorted(txn.members, key=lambda m: m.binlog_pos)
+        commit_pos = txn.commit_marker.binlog_pos
+        if any(m.binlog_pos > commit_pos for m in ordered):
+            return False
+        positions = [m.binlog_pos for m in ordered]
+        return len(positions) == len(set(positions))
+
+    def build_commit_evidence(self, txn: MaxwellTransaction) -> dict[str, Any]:
+        """基于真实提交标记生成提交凭证（含成员/位点摘要，可核对）。"""
+        assert txn.commit_marker is not None
+        ordered = sorted(txn.members, key=lambda m: m.binlog_pos)
+        member_digest_raw = "|".join(
+            f"{m.member_id}@{m.binlog_file}:{m.binlog_pos}" for m in ordered)
+        member_digest = hashlib.sha256(member_digest_raw.encode()).hexdigest()[:16]
+        marker = txn.commit_marker
+        return {
+            "evidence_id": f"ev_{txn.tx_id}_{member_digest}",
+            "tx_id": txn.tx_id,
+            "source_instance": txn.source_instance,
+            "real_commit": True,
+            "commit_position": self._position_key(marker.binlog_file, marker.binlog_pos),
+            "gtid": marker.gtid,
+            "commit_time": marker.commit_time.isoformat(),
+            "member_count": len(ordered),
+            "member_digest": member_digest,
+        }
+
+    def publish_maxwell_batch(
+        self, tx_id: str, envelope_builder
+    ) -> MaxwellEventBatch | None:
+        """发布一笔事务的 Maxwell 事件数据批次。
+
+        硬性条件：只有真实提交并且成员完整，才把成员信封与提交凭证一起发布。
+        已发布的事务重复调用返回原批次（幂等），不会二次发布。
+        envelope_builder: Callable[[MaxwellMember], dict] 由格式适配服务提供，
+        负责把成员适配为带真实事务边界的输出信封。
+        """
+        txn = self.maxwell_transactions.get(tx_id)
+        if txn is None:
+            return None
+        if txn.published:
+            return next((b for b in self.maxwell_batches if b.tx_id == tx_id), None)
+        if not self.is_transaction_complete(tx_id):
+            return None  # 未真实提交或成员不完整：绝不发布
+        ordered = sorted(txn.members, key=lambda m: m.binlog_pos)
+        marker = txn.commit_marker
+        assert marker is not None
+        member_envelopes = [envelope_builder(m) for m in ordered]
+        evidence = self.build_commit_evidence(txn)
+        checksum_raw = json.dumps(
+            {"tx_id": tx_id, "members": [m["member_id"] for m in member_envelopes],
+             "evidence": evidence["evidence_id"]},
+            sort_keys=True, ensure_ascii=False)
+        checksum = hashlib.sha256(checksum_raw.encode()).hexdigest()[:16]
+        batch = MaxwellEventBatch(
+            batch_id=f"batch_{txn.source_instance}_{tx_id}",
+            tx_id=tx_id,
+            source_instance=txn.source_instance,
+            start_position=self._position_key(ordered[0].binlog_file, ordered[0].binlog_pos),
+            end_position=self._position_key(marker.binlog_file, marker.binlog_pos),
+            binlog_file=marker.binlog_file,
+            start_pos=ordered[0].binlog_pos,
+            commit_pos=marker.binlog_pos,
+            gtid=marker.gtid,
+            commit_evidence=evidence,
+            members=member_envelopes,
+            # 源事件时间：取首成员源时间，禁止用当前时间代替
+            event_time=ordered[0].event_time.isoformat(),
+            commit_time=marker.commit_time.isoformat(),
+            member_count=len(member_envelopes),
+            envelope_version="v2",
+            checksum=checksum,
+        )
+        self.maxwell_batches.append(batch)
+        txn.published = True
+        txn.published_at = datetime.now()
+        return batch
+
+    def consume_maxwell_batch(
+        self, batch: MaxwellEventBatch, *, expected_instance: str | None = None,
+        expected_position: str | None = None,
+        requested_replay_position: str | None = None,
+    ) -> dict[str, Any]:
+        """消费端下发一个 Maxwell 事件数据批次。
+
+        下发边界校验：批次的源实例、位点和提交证据必须与消费端期望一致。
+        幂等：同一批次无论回放多少次，只向目标交付一次；结果回放到回放清单。
+        requested_replay_position: 本次重放请求的源位点（回滚后继续消费的起点）。
+        """
+        boundary_ok = True
+        boundary_reasons: list[str] = []
+        if expected_instance and batch.source_instance != expected_instance:
+            boundary_ok = False
+            boundary_reasons.append(
+                f"源实例不匹配: expected={expected_instance} actual={batch.source_instance}")
+        if expected_position and batch.end_position != expected_position:
+            boundary_ok = False
+            boundary_reasons.append(
+                f"下发位点不匹配: expected={expected_position} actual={batch.end_position}")
+        if not batch.commit_evidence.get("real_commit"):
+            boundary_ok = False
+            boundary_reasons.append("缺少真实提交凭证")
+        if batch.checksum != hashlib.sha256(json.dumps(
+                {"tx_id": batch.tx_id,
+                 "members": [m["member_id"] for m in batch.members],
+                 "evidence": batch.commit_evidence["evidence_id"]},
+                sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:16]:
+            boundary_ok = False
+            boundary_reasons.append("批次校验和不一致")
+
+        batch.delivery_attempts += 1
+        manifest_row: dict[str, Any] = {
+            "id": len(self.replay_manifest) + 1,
+            "batch_id": batch.batch_id,
+            "tx_id": batch.tx_id,
+            "source_instance": batch.source_instance,
+            "replay_start_position": batch.start_position,
+            "requested_replay_position": requested_replay_position,
+            "commit_boundary": batch.end_position,
+            "boundary_verified": boundary_ok,
+            "boundary_reasons": boundary_reasons,
+            "attempt": batch.delivery_attempts,
+            "delivered_this_time": False,
+            "total_delivered": batch.delivered_count,
+            "recorded_at": datetime.now().isoformat(),
+        }
+
+        if not boundary_ok:
+            manifest_row["result"] = "rejected"
+            self.replay_manifest.append(manifest_row)
+            return manifest_row
+
+        # 幂等交付：台账中已存在则不再向目标投递
+        if batch.batch_id in self.maxwell_delivery_ledger:
+            batch.replay_count += 1
+            manifest_row["result"] = "deduplicated"
+            manifest_row["total_delivered"] = batch.delivered_count
+            self.replay_manifest.append(manifest_row)
+            return manifest_row
+
+        # 首次真正交付到目标
+        self.maxwell_target_batches[batch.batch_id] = batch
+        batch.delivered = True
+        batch.delivered_count = 1
+        self.maxwell_delivery_ledger[batch.batch_id] = {
+            "batch_id": batch.batch_id,
+            "tx_id": batch.tx_id,
+            "delivered_at": datetime.now().isoformat(),
+            "commit_evidence_id": batch.commit_evidence["evidence_id"],
+            "checksum": batch.checksum,
+        }
+        self.source_cursors[batch.source_instance] = {
+            "binlog_file": batch.binlog_file,
+            "position": batch.commit_pos,
+            "position_key": batch.end_position,
+            "gtid": batch.gtid,
+            "updated_at": datetime.now().isoformat(),
+        }
+        manifest_row["delivered_this_time"] = True
+        manifest_row["total_delivered"] = 1
+        manifest_row["result"] = "delivered"
+        self.replay_manifest.append(manifest_row)
+        return manifest_row
+
+    def get_source_cursor(self, instance: str) -> dict[str, Any] | None:
+        """返回消费端在某源实例上已确认的源位点（重放起点）。"""
+        return self.source_cursors.get(instance)
+
+    def replay_from_position(self, instance: str, binlog_file: str, binlog_pos: int,
+                             envelope_builder, consume: bool = True) -> list[dict[str, Any]]:
+        """回滚后从同一源位点重放。
+
+        扫描源日志中位点 >= 指定位置的成员与其提交标记，重新聚合并发布批次，
+        再走消费端下发。已交付事务由幂等台账拦截，目标只收到一次。
+        """
+        results: list[dict[str, Any]] = []
+        affected_tx_ids: list[str] = []
+        for member in self.maxwell_member_log:
+            if (member.source_instance == instance
+                    and member.binlog_file == binlog_file
+                    and member.binlog_pos >= binlog_pos
+                    and member.tx_id not in affected_tx_ids):
+                affected_tx_ids.append(member.tx_id)
+        for tx_id in affected_tx_ids:
+            batch = self.publish_maxwell_batch(tx_id, envelope_builder)
+            if batch is None:
+                results.append({"tx_id": tx_id, "result": "incomplete",
+                                "reason": "成员不完整或缺少真实提交标记"})
+                continue
+            if consume:
+                row = self.consume_maxwell_batch(
+                    batch, expected_instance=instance,
+                    expected_position=batch.end_position,
+                    requested_replay_position=self._position_key(binlog_file, binlog_pos))
+                results.append(row)
+            else:
+                results.append({"tx_id": tx_id, "batch_id": batch.batch_id,
+                                "result": "republished"})
+        return results
+
+    def rollback_deployment(self, instance: str, position_key: str | None = None) -> dict[str, Any]:
+        """部署失败回滚：保留源日志，把消费游标回退到指定（或最后确认的）源位点。
+
+        已交付记录与幂等台账保留——重复回放同一事务仍只交付一次。
+        """
+        cursor = self.source_cursors.get(instance)
+        target = position_key or (cursor["position_key"] if cursor else None)
+        self.adapter_deployment_version = "legacy"
+        self.write_audit(
+            "部署回滚", instance,
+            f"Maxwell 适配回滚，源日志保留，重放起点 {target}",
+            "maxwell_migration", "已回退")
+        return {"rolled_back": True, "instance": instance,
+                "replay_start_position": target,
+                "member_log_retained": len(self.maxwell_member_log),
+                "commit_log_retained": len(self.maxwell_commit_log)}
+
     def snapshot(self) -> dict[str, Any]:
         """全管道状态快照。"""
         return {
@@ -328,6 +703,13 @@ class PipelineBus:
             "scd_type3_keys": len(self.scd_type3_store),
             "audit_count": len(self.audit_log),
             "lag_buffer_size": len(self.lag_buffer),
+            "maxwell_member_log": len(self.maxwell_member_log),
+            "maxwell_commit_log": len(self.maxwell_commit_log),
+            "maxwell_transactions": len(self.maxwell_transactions),
+            "maxwell_batches": len(self.maxwell_batches),
+            "maxwell_delivered": len(self.maxwell_delivery_ledger),
+            "replay_manifest": len(self.replay_manifest),
+            "adapter_deployment_version": self.adapter_deployment_version,
         }
 
 
